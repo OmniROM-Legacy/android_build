@@ -52,7 +52,7 @@ gerrit_url = "gerrit.omnirom.org"
 
 def check_repo_exists(git_data, device):
     re_match = "^android_device_.*_{device}$".format(device=device)
-    matches = filter(lambda x: re.match(re_match, x), git_data)
+    matches = list(filter(lambda x: re.match(re_match, x), git_data))
     if len(matches) != 1:
         raise Exception("{device} not found,"
                         "exiting roomservice".format(device=device))
@@ -69,10 +69,10 @@ def search_gerrit_for_device(device):
     git_req = urllib.request.Request(git_search_url)
     try:
         response = urllib.request.urlopen(git_req)
-    except urllib.request.HTTPError as e:
+    except urllib.request.HTTPError:
         print("There was an issue connecting to gerrit."
-                        " Please try again in a minute")
-    except urllib.request.URLError as e:
+              " Please try again in a minute")
+    except urllib.request.URLError:
         print("WARNING: No network connection available.")
     else:
         # Skip silly gerrit "header"
@@ -106,19 +106,41 @@ def iterate_manifests():
         try:
             man = ES.parse(file)
             man = man.getroot()
-        except IOError, ES.ParseError:
+        except (IOError, ES.ParseError):
             print("WARNING: error while parsing %s" % file)
         else:
             for project in man.findall("project"):
                 yield project
 
+def iterate_manifests_remove_project():
+    files = []
+    for file in os.listdir(local_manifest_dir):
+        if file.endswith(".xml"):
+            files.append(os.path.join(local_manifest_dir, file))
+    files.append('.repo/manifest.xml')
+    for file in files:
+        try:
+            man = ES.parse(file)
+            man = man.getroot()
+        except (IOError, ES.ParseError):
+            print("WARNING: error while parsing %s" % file)
+        else:
+            for project in man.findall("remove-project"):
+                yield project
 
 def check_project_exists(url, revision, path):
     for project in iterate_manifests():
-        if project.get("name") == url and project.get("revision") == revision and project.get("path") == path:
+        if project.get("name") == url \
+                and project.get("revision") == revision \
+                and project.get("path") == path:
             return True
     return False
 
+def check_remove_project_exists(url):
+    for project in iterate_manifests_remove_project():
+        if project.get("name") == url:
+            return True
+    return False
 
 def check_target_exists(directory):
     return os.path.isdir(directory)
@@ -158,13 +180,45 @@ def create_manifest_project(url, directory,
                          })
     return project
 
+def create_remove_project(url):
+    remove_project_exists = check_remove_project_exists(url)
+
+    if remove_project_exists:
+        return None
+
+    project = ES.Element("remove-project",
+                         attrib={
+                             "name": url
+                         })
+    return project
+
+# Avoid adding already in manifests declared repositories in the roomservice.xml
+def is_in_manifest(project):
+    files = []
+    for file in os.listdir(local_manifest_dir):
+        if file.endswith(".xml") and file != "roomservice.xml":
+            files.append(os.path.join(local_manifest_dir, file))
+    files.append('.repo/manifest.xml')
+    for file in files:
+        try:
+            man = ES.parse(file)
+            man = man.getroot()
+            for project_in_manifests in man.findall("project"):
+                if project_in_manifests.get("path") == project.get("path") or project_in_manifests.get("path") == project.get("target_path"): # path -> def append_to_manifest(project) & target_path -> def check_manifest_problems(dependencies)
+                    return True
+        except (IOError, ES.ParseError):
+            print("WARNING: error while parsing %s" % file)
+    return False
 
 def append_to_manifest(project):
     try:
         lm = ES.parse('/'.join([local_manifest_dir, "roomservice.xml"]))
         lm = lm.getroot()
-    except IOError, ES.ParseError:
+    except (IOError, ES.ParseError):
         lm = ES.Element("manifest")
+    if is_in_manifest(project):
+        print("HINT: The following repository is already defined in a manifest:", project.get("name"))
+        return lm
     lm.append(project)
     return lm
 
@@ -191,6 +245,8 @@ def parse_device_from_manifest(device):
 
 def parse_device_from_folder(device):
     search = []
+    if not os.path.isdir("device"):
+        os.mkdir("device")
     for sub_folder in os.listdir("device"):
         if os.path.isdir("device/%s/%s" % (sub_folder, device)):
             search.append("device/%s/%s" % (sub_folder, device))
@@ -223,25 +279,31 @@ def parse_dependency_file(location):
 # delete the roomservice.xml file and create new
 def check_manifest_problems(dependencies):
     for dependency in dependencies:
+        if is_in_manifest(dependency):
+            continue
         repository = dependency.get("repository")
         target_path = dependency.get("target_path")
         revision = dependency.get("revision", default_rev)
-        remote = dependency.get("remote", default_rem)
 
         # check for existing projects
         for project in iterate_manifests():
-            if project.get("revision") is not None and project.get("path") is not None:
-                if project.get("path") == target_path and project.get("revision") != revision:
-                    print("WARNING: detected conflict in revisions for repository ", repository)
-                    current_dependency = str(project.get(repository))
-                    file = ES.parse('/'.join([local_manifest_dir, "roomservice.xml"]))
-                    file_root = file.getroot()
-                    for current_project in file_root.findall('project'):
-                        new_dependency = str(current_project.find('revision'))
-                        if new_dependency == current_dependency:
-                            file_root.remove(current_project)
-                    file.write('/'.join([local_manifest_dir, "roomservice.xml"]))
-                    return
+            if project.get("revision") is not None \
+                    and project.get("path") is not None \
+                    and project.get("path") == target_path \
+                    and project.get("revision") != revision:
+                print("WARNING: detected conflict in revisions for repository ",
+                      repository)
+                current_dependency = str(project.get(repository))
+                file = ES.parse('/'.join([local_manifest_dir,
+                                          "roomservice.xml"]))
+                file_root = file.getroot()
+                for current_project in file_root.findall('project'):
+                    new_dependency = str(current_project.find('revision'))
+                    if new_dependency == current_dependency:
+                        file_root.remove(current_project)
+                file.write('/'.join([local_manifest_dir, "roomservice.xml"]))
+                return
+
 
 def create_dependency_manifest(dependencies):
     projects = []
@@ -250,6 +312,14 @@ def create_dependency_manifest(dependencies):
         target_path = dependency.get("target_path")
         revision = dependency.get("revision", default_rev)
         remote = dependency.get("remote", default_rem)
+        override = dependency.get("override", None)
+        if override is not None:
+            #print("found override in ", repository)
+            project = create_remove_project(repository)
+            if project is not None:
+                manifest = append_to_manifest(project)
+                #print(ES.tostring(manifest).decode())
+                write_to_manifest(manifest)
 
         # not adding an organization should default to android_team
         # only apply this to github
@@ -291,7 +361,7 @@ def create_common_dependencies_manifest(dependencies):
 
                     if common_deps is not None:
                         print("Looking for dependencies on: ",
-                               dependency['target_path'])
+                              dependency['target_path'])
                         check_manifest_problems(common_deps)
                         create_dependency_manifest(common_deps)
                         create_common_dependencies_manifest(common_deps)
@@ -317,14 +387,15 @@ def check_device_exists(device):
 
 def fetch_device(device):
     if check_device_exists(device):
-        print("WARNING: Trying to fetch a device that's already there")
+        print("HINT: Avoid fetching the already checked out device repo:", device")
+        return
     git_data = search_gerrit_for_device(device)
     if git_data is not None:
         device_url = git_data['id']
         device_dir = parse_device_directory(device_url, device)
         project = create_manifest_project(device_url,
-                                      device_dir,
-                                      remote=default_team_rem)
+                                          device_dir,
+                                          remote=default_team_rem)
         if project is not None:
             manifest = append_to_manifest(project)
             write_to_manifest(manifest)
